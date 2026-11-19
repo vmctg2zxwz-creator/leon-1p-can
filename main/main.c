@@ -1,27 +1,22 @@
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_timer.h"
-#include "lvgl.h"
-#include "display.h"
-#include "obd.h"
+#include "bsp/esp-bsp.h"
+#include "bsp/display.h"
+#include "can.h"
 #include "ui.h"
-
-static uint32_t tick_ms(void)
-{
-    return (uint32_t)(esp_timer_get_time() / 1000);
-}
 
 void app_main(void)
 {
-    lv_init();
-    lv_tick_set_cb(tick_ms);
-    display_init();
+    /* Οθόνη 10.1" + LVGL από το BSP της Waveshare. */
+    bsp_display_cfg_t cfg = {
+        .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
+        .rotation = ESP_LV_ADAPTER_ROTATE_0,
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL,
+    };
+    bsp_display_start_with_config(&cfg);
+    bsp_display_backlight_on();
+
+    bsp_display_lock(-1);
     ui_create();
+    bsp_display_unlock();
 
-    obd_start();
-
-    for (;;) {
-        uint32_t wait = lv_timer_handler();
-        vTaskDelay(pdMS_TO_TICKS(wait < 5 ? 5 : (wait > 30 ? 30 : wait)));
-    }
+    can_start();
 }

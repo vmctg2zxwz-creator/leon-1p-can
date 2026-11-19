@@ -1,118 +1,84 @@
 #include "ui.h"
+#include <stdio.h>
 #include "lvgl.h"
-#include "obd.h"
+#include "can.h"
 
-#define RPM_MAX 7000
+/*
+ * Απλή οθόνη: τρεις μεγάλοι αριθμοί, ο ένας κάτω από τον άλλο.
+ * ΣΤΡΟΦΕΣ / ΝΕΡΟ / ΕΙΣΑΓΩΓΗ. "--" όταν δεν έρχονται δεδομένα.
+ */
 
-static lv_obj_t *s_rpm_arc;
-static lv_obj_t *s_rpm_lbl;
-static lv_obj_t *s_speed_lbl;
-static lv_obj_t *s_coolant_lbl;
-static lv_obj_t *s_boost_lbl;
-static lv_obj_t *s_iat_lbl;
-static lv_obj_t *s_volt_lbl;
-static lv_obj_t *s_status_lbl;
+#define BIG_SCALE 768   /* 256 = 1x, 768 = 3x το font 48 */
 
-static lv_obj_t *make_tile(lv_obj_t *parent, const char *title, lv_obj_t **value)
+static lv_obj_t *s_rpm, *s_coolant, *s_intake;
+
+static lv_obj_t *make_row(lv_obj_t *parent, const char *title, const char *unit)
 {
-    lv_obj_t *box = lv_obj_create(parent);
-    lv_obj_set_size(box, 170, 100);
-    lv_obj_set_style_bg_color(box, lv_color_hex(0x1a1a1a), 0);
-    lv_obj_set_style_border_width(box, 0, 0);
-    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_flex_grow(row, 1);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_radius(row, 16, 0);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *t = lv_label_create(box);
+    lv_obj_t *t = lv_label_create(row);
     lv_label_set_text(t, title);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_32, 0);
     lv_obj_set_style_text_color(t, lv_color_hex(0x9e9e9e), 0);
-    lv_obj_align(t, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_LEFT, 10, 10);
 
-    *value = lv_label_create(box);
-    lv_label_set_text(*value, "--");
-    lv_obj_set_style_text_font(*value, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(*value, lv_color_white(), 0);
-    lv_obj_align(*value, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-    return box;
+    lv_obj_t *u = lv_label_create(row);
+    lv_label_set_text(u, unit);
+    lv_obj_set_style_text_font(u, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(u, lv_color_hex(0x9e9e9e), 0);
+    lv_obj_align(u, LV_ALIGN_BOTTOM_RIGHT, -10, -10);
+
+    lv_obj_t *v = lv_label_create(row);
+    lv_label_set_text(v, "--");
+    lv_obj_set_style_text_font(v, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(v, lv_color_white(), 0);
+    lv_obj_set_style_transform_scale(v, BIG_SCALE, 0);
+    lv_obj_set_style_transform_pivot_x(v, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(v, lv_pct(50), 0);
+    lv_obj_align(v, LV_ALIGN_CENTER, 0, 0);
+    return v;
+}
+
+static void set_value(lv_obj_t *lbl, bool ok, int value, lv_color_t color)
+{
+    if (ok) {
+        lv_label_set_text_fmt(lbl, "%d", value);
+    } else {
+        lv_label_set_text(lbl, "--");
+    }
+    lv_obj_set_style_text_color(lbl, color, 0);
 }
 
 static void refresh_cb(lv_timer_t *t)
 {
-    car_data_t d = obd_get();
+    car_data_t d = can_get();
+    lv_color_t white = lv_color_white();
+    lv_color_t red = lv_color_hex(0xff3b30);
+    lv_color_t blue = lv_color_hex(0x40a9ff);
 
-    lv_label_set_text(s_status_lbl, d.connected ? "CAN OK" : "No CAN");
-    lv_obj_set_style_text_color(s_status_lbl,
-        d.connected ? lv_color_hex(0x4caf50) : lv_color_hex(0xf44336), 0);
-    if (!d.connected) {
-        return;
-    }
-
-    int rpm = (int)d.rpm;
-    lv_arc_set_value(s_rpm_arc, rpm > RPM_MAX ? RPM_MAX : rpm);
-    lv_obj_set_style_arc_color(s_rpm_arc,
-        rpm > 4500 ? lv_color_hex(0xf44336) : lv_color_hex(0x03a9f4), LV_PART_INDICATOR);
-    lv_label_set_text_fmt(s_rpm_lbl, "%d", rpm);
-    lv_label_set_text_fmt(s_speed_lbl, "%d km/h", (int)d.speed_kmh);
-
-    lv_label_set_text_fmt(s_coolant_lbl, "%d °C", (int)d.coolant_c);
-    lv_obj_set_style_text_color(s_coolant_lbl,
-        d.coolant_c > 105 ? lv_color_hex(0xf44336) : lv_color_white(), 0);
-
-    /* Boost/μπαταρία: μένουν "--" μέχρι να επιβεβαιωθεί η πηγή τους. */
-
-    lv_label_set_text_fmt(s_iat_lbl, "%d °C", (int)d.intake_c);
+    set_value(s_rpm, d.rpm_ok, (int)d.rpm, d.rpm > 6000 ? red : white);
+    set_value(s_coolant, d.coolant_ok, (int)d.coolant_c,
+              d.coolant_c > 105 ? red : (d.coolant_c < 70 ? blue : white));
+    set_value(s_intake, d.intake_ok, (int)d.intake_c, d.intake_c > 60 ? red : white);
 }
 
 void ui_create(void)
 {
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_pad_all(scr, 16, 0);
+    lv_obj_set_style_pad_row(scr, 16, 0);
+    lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
 
-    /* Στροφόμετρο */
-    s_rpm_arc = lv_arc_create(scr);
-    lv_obj_set_size(s_rpm_arc, 360, 360);
-    lv_obj_align(s_rpm_arc, LV_ALIGN_LEFT_MID, 30, 20);
-    lv_arc_set_rotation(s_rpm_arc, 135);
-    lv_arc_set_bg_angles(s_rpm_arc, 0, 270);
-    lv_arc_set_range(s_rpm_arc, 0, RPM_MAX);
-    lv_arc_set_value(s_rpm_arc, 0);
-    lv_obj_remove_style(s_rpm_arc, NULL, LV_PART_KNOB);
-    lv_obj_clear_flag(s_rpm_arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_width(s_rpm_arc, 24, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(s_rpm_arc, 24, LV_PART_INDICATOR);
-
-    s_rpm_lbl = lv_label_create(scr);
-    lv_obj_set_style_text_font(s_rpm_lbl, &lv_font_montserrat_48, 0);
-    lv_obj_set_style_text_color(s_rpm_lbl, lv_color_white(), 0);
-    lv_label_set_text(s_rpm_lbl, "0");
-    lv_obj_align_to(s_rpm_lbl, s_rpm_arc, LV_ALIGN_CENTER, 0, -10);
-
-    s_speed_lbl = lv_label_create(scr);
-    lv_obj_set_style_text_font(s_speed_lbl, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(s_speed_lbl, lv_color_hex(0xbdbdbd), 0);
-    lv_label_set_text(s_speed_lbl, "0 km/h");
-    lv_obj_align_to(s_speed_lbl, s_rpm_arc, LV_ALIGN_CENTER, 0, 40);
-
-    /* Πλακίδια δεξιά */
-    lv_obj_t *grid = lv_obj_create(scr);
-    lv_obj_set_size(grid, 380, 340);
-    lv_obj_align(grid, LV_ALIGN_RIGHT_MID, -10, 20);
-    lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(grid, 0, 0);
-    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_style_pad_gap(grid, 12, 0);
-
-    make_tile(grid, "Coolant", &s_coolant_lbl);
-    make_tile(grid, "Boost", &s_boost_lbl);
-    make_tile(grid, "Intake air", &s_iat_lbl);
-    make_tile(grid, "Battery", &s_volt_lbl);
-
-    s_status_lbl = lv_label_create(scr);
-    lv_label_set_text(s_status_lbl, "No CAN");
-    lv_obj_align(s_status_lbl, LV_ALIGN_TOP_RIGHT, -20, 15);
-
-    lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "LEON 1P");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x9e9e9e), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 20, 15);
+    s_rpm = make_row(scr, "RPM", "rpm");
+    s_coolant = make_row(scr, "COOLANT", "°C");
+    s_intake = make_row(scr, "INTAKE AIR", "°C");
 
     lv_timer_create(refresh_cb, 100, NULL);
 }

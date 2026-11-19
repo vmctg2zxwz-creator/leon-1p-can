@@ -19,12 +19,11 @@ jobs:
       - name: Build with ESP-IDF
         uses: espressif/esp-idf-ci-action@v1
         with:
-          esp_idf_version: v5.5
+          esp_idf_version: v6.1.1
           target: esp32p4
           command: >-
             idf.py build &&
-            cd build &&
-            esptool.py --chip esp32p4 merge_bin -o leon-1p-can-full.bin @flash_args
+            idf.py merge-bin -o leon-1p-can-full.bin
 
       - name: Collect binaries
         run: |
