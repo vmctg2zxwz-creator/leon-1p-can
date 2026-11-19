@@ -68,7 +68,7 @@ void can_start(void)
         .flags = { .enable_listen_only = true },
     };
     twai_node_handle_t node;
-    ESP_ERROR_CHECK(twai_new_onchip_node(&cfg, &node));
+    ESP_ERROR_CHECK(twai_new_node_onchip(&cfg, &node));
 
     twai_event_callbacks_t cbs = { .on_rx_done = on_rx };
     ESP_ERROR_CHECK(twai_node_register_event_callbacks(node, &cbs, NULL));
