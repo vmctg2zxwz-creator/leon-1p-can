@@ -3,6 +3,8 @@
  * - Η οθόνη δείχνει ακριβώς το ίδιο κείμενο με το serial (μόνο κείμενο).
  * - CAN 500 kbit/s, μόνο ακρόαση (δεν στέλνει τίποτα στο αυτοκίνητο).
  * - Χρονισμός σταθερός: SP65 (βρέθηκε με scan στο αυτοκίνητο, 0 err/s).
+ * - Bytes που άλλαξαν μέσα στο τελευταίο δευτερόλεπτο βγαίνουν ΚΟΚΚΙΝΑ
+ *   (για να βρίσκουμε ποιο byte είναι γκάζι, φρένο, τιμόνι κ.λπ.).
  * - Προστασία: αν έρθουν πάρα πολλά σφάλματα, το CAN σταματά για 2 s.
  * - Serial 115200 baud. Κάθε 1 δευτερόλεπτο τυπώνει έναν πίνακα:
  *   μία γραμμή για κάθε ID με πόσα μηνύματα ήρθαν και τα τελευταία δεδομένα,
@@ -33,6 +35,7 @@ typedef struct {
     uint8_t  len;
     uint8_t  data[8];
     uint32_t count;     /* μηνύματα από την τελευταία εκτύπωση */
+    uint8_t  changed;   /* bit i = το byte i άλλαξε από την τελευταία εκτύπωση */
 } slot_t;
 
 static slot_t s_tab[MAX_IDS];
@@ -67,6 +70,11 @@ static bool on_rx(twai_node_handle_t node, const twai_rx_done_event_data_t *e, v
         s->ext = f.header.ide;
     }
     if (s) {
+        for (int i = 0; i < 8; i++) {
+            if (s->len && s->data[i] != d[i]) {
+                s->changed |= (1u << i);
+            }
+        }
         s->len = len;
         memcpy(s->data, d, sizeof(d));
         s->count++;
@@ -164,7 +172,8 @@ static int by_id(const void *a, const void *b)
 #define TEXT_ROTATION 900
 
 static lv_obj_t *s_label;
-static char s_txt[4096];
+static char s_txt[6144];   /* οθόνη (με χρώματα LVGL) */
+static char s_ser[6144];   /* serial (με χρώματα ANSI) */
 
 static void screen_init(void)
 {
@@ -193,6 +202,7 @@ static void screen_init(void)
 #else
     lv_obj_set_pos(s_label, 8, 1272);         /* ξεκινά κάτω αριστερά */
 #endif
+    lv_label_set_recolor(s_label, true);
     lv_label_set_text(s_label, "leon-1p-can");
     bsp_display_unlock();
 
@@ -203,14 +213,24 @@ static void screen_init(void)
 /* Στέλνει το s_txt στο serial και στην οθόνη. */
 static void show(void)
 {
-    printf("\n%s", s_txt);
+    printf("\n%s", s_ser);
     if (bsp_display_lock(100) == ESP_OK) {
         lv_label_set_text(s_label, s_txt);
         bsp_display_unlock();
     }
 }
 
-#define ADD(len, ...) do { if ((len) < (int)sizeof(s_txt)) (len) += snprintf(s_txt + (len), sizeof(s_txt) - (len), __VA_ARGS__); } while (0)
+/* Γράφει το ίδιο κείμενο και στα δύο buffers. */
+static int s_len_ser;
+#define ADD(len, ...) do { \
+    if ((len) < (int)sizeof(s_txt)) (len) += snprintf(s_txt + (len), sizeof(s_txt) - (len), __VA_ARGS__); \
+    if (s_len_ser < (int)sizeof(s_ser)) s_len_ser += snprintf(s_ser + s_len_ser, sizeof(s_ser) - s_len_ser, __VA_ARGS__); \
+} while (0)
+/* Byte που άλλαξε: κόκκινο στην οθόνη, κόκκινο (ANSI) στο serial. */
+#define ADD_RED_BYTE(len, v) do { \
+    if ((len) < (int)sizeof(s_txt)) (len) += snprintf(s_txt + (len), sizeof(s_txt) - (len), " #ff3030 %02X#", (v)); \
+    if (s_len_ser < (int)sizeof(s_ser)) s_len_ser += snprintf(s_ser + s_len_ser, sizeof(s_ser) - s_len_ser, " \033[1;31m%02X\033[0m", (v)); \
+} while (0)
 
 /* ---------------- Προστασία από πλημμύρα σφαλμάτων ---------------- */
 
@@ -271,6 +291,7 @@ void app_main(void)
         memcpy(snap, s_tab, n * sizeof(slot_t));
         for (int i = 0; i < n; i++) {
             s_tab[i].count = 0;
+            s_tab[i].changed = 0;
         }
         uint32_t total = s_total, full = s_full;
         uint32_t e_stuff = s_err_stuff, e_form = s_err_form, e_bit = s_err_bit, e_other = s_err_other;
@@ -286,6 +307,7 @@ void app_main(void)
         uint32_t errs = e_stuff + e_form + e_bit + e_other;
 
         int len = 0;
+        s_len_ser = 0;
         ADD(len, "timing: %s   last reset: %s   pauses: %" PRIu32 "\n", best->name, boot, s_pauses);
         ADD(len, "   ID   /s DLC DATA\n");
         for (int i = 0; i < n; i++) {
@@ -297,7 +319,11 @@ void app_main(void)
             }
             ADD(len, " %4" PRIu32 " [%u]", s->count, s->len);
             for (int b = 0; b < s->len; b++) {
-                ADD(len, " %02X", s->data[b]);
+                if (s->changed & (1u << b)) {
+                    ADD_RED_BYTE(len, s->data[b]);
+                } else {
+                    ADD(len, " %02X", s->data[b]);
+                }
             }
             ADD(len, "\n");
         }
