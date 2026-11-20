@@ -31,6 +31,7 @@ typedef struct {
 static slot_t s_tab[MAX_IDS];
 static int s_used;
 static uint32_t s_total, s_full;
+static uint32_t s_err_stuff, s_err_form, s_err_bit, s_err_other;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static bool on_rx(twai_node_handle_t node, const twai_rx_done_event_data_t *e, void *ctx)
@@ -67,6 +68,17 @@ static bool on_rx(twai_node_handle_t node, const twai_rx_done_event_data_t *e, v
     return false;
 }
 
+static bool on_error(twai_node_handle_t node, const twai_error_event_data_t *e, void *ctx)
+{
+    portENTER_CRITICAL_ISR(&s_lock);
+    if (e->err_flags.stuff_err) s_err_stuff++;
+    else if (e->err_flags.form_err) s_err_form++;
+    else if (e->err_flags.bit_err) s_err_bit++;
+    else s_err_other++;
+    portEXIT_CRITICAL_ISR(&s_lock);
+    return false;
+}
+
 static const char *state_name(twai_error_state_t s)
 {
     switch (s) {
@@ -93,13 +105,14 @@ void app_main(void)
             .quanta_clk_out = -1,
             .bus_off_indicator = -1,
         },
-        .bit_timing = { .bitrate = CAN_BITRATE },
+        /* Sample point 87.5%, όπως συνήθως στο CAN της VW. */
+        .bit_timing = { .bitrate = CAN_BITRATE, .sp_permill = 875 },
         .tx_queue_depth = 1,
         .flags = { .enable_listen_only = true },
     };
     twai_node_handle_t node;
     ESP_ERROR_CHECK(twai_new_node_onchip(&cfg, &node));
-    twai_event_callbacks_t cbs = { .on_rx_done = on_rx };
+    twai_event_callbacks_t cbs = { .on_rx_done = on_rx, .on_error = on_error };
     ESP_ERROR_CHECK(twai_node_register_event_callbacks(node, &cbs, NULL));
     ESP_ERROR_CHECK(twai_node_enable(node));
 
@@ -117,7 +130,9 @@ void app_main(void)
             s_tab[i].count = 0;
         }
         uint32_t total = s_total, full = s_full;
+        uint32_t e_stuff = s_err_stuff, e_form = s_err_form, e_bit = s_err_bit, e_other = s_err_other;
         s_total = 0;
+        s_err_stuff = s_err_form = s_err_bit = s_err_other = 0;
         portEXIT_CRITICAL(&s_lock);
 
         qsort(snap, n, sizeof(slot_t), by_id);
@@ -136,9 +151,12 @@ void app_main(void)
         twai_node_status_t st = {0};
         twai_node_record_t rec = {0};
         twai_node_get_info(node, &st, &rec);
-        printf("--- %" PRIu32 " msg/s | IDs: %d | bus errors: %" PRIu32 " | rx err: %u | state: %s%s ---\n",
-               total, n, rec.bus_err_num, st.rx_error_count, state_name(st.state),
-               full ? " | ID table full" : "");
+        uint32_t errs = e_stuff + e_form + e_bit + e_other;
+        printf("--- %" PRIu32 " msg/s | IDs: %d | errors/s: %" PRIu32
+               " (stuff %" PRIu32 ", form %" PRIu32 ", bit %" PRIu32 ", other %" PRIu32 ")"
+               " | total errors: %" PRIu32 " | state: %s%s ---\n",
+               total, n, errs, e_stuff, e_form, e_bit, e_other,
+               rec.bus_err_num, state_name(st.state), full ? " | ID table full" : "");
         if (st.state == TWAI_ERROR_BUS_OFF) {
             twai_node_recover(node);
         }
