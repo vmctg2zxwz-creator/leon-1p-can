@@ -5,6 +5,10 @@
  * - Χρονισμός σταθερός: SP65 (βρέθηκε με scan στο αυτοκίνητο, 0 err/s).
  * - Bytes που άλλαξαν μέσα στο τελευταίο δευτερόλεπτο βγαίνουν ΚΟΚΚΙΝΑ
  *   (για να βρίσκουμε ποιο byte είναι γκάζι, φρένο, τιμόνι κ.λπ.).
+ * - Μέτρηση σήματος: το RMT διαβάζει το ίδιο pin RX (GPIO3) και μετράει πόσο
+ *   διαρκεί κάθε dominant (low) και recessive (high) παλμός. Κανονικά κάθε
+ *   παλμός είναι ακριβώς N x 2000 ns. Η απόκλιση δείχνει αν το σήμα στο pin
+ *   είναι στρεβλό (π.χ. dominant πιο κοντά) και γιατί χρειάζεται SP65.
  * - Προστασία: αν έρθουν πάρα πολλά σφάλματα, το CAN σταματά για 2 s.
  * - Serial 115200 baud. Κάθε 1 δευτερόλεπτο τυπώνει έναν πίνακα:
  *   μία γραμμή για κάθε ID με πόσα μηνύματα ήρθαν και τα τελευταία δεδομένα,
@@ -17,12 +21,14 @@
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 #include "lvgl.h"
 #include "esp_system.h"
+#include "driver/rmt_rx.h"
 
 #define CAN_TX_GPIO 2
 #define CAN_RX_GPIO 3
@@ -232,6 +238,99 @@ static int s_len_ser;
     if (s_len_ser < (int)sizeof(s_ser)) s_len_ser += snprintf(s_ser + s_len_ser, sizeof(s_ser) - s_len_ser, " \033[1;31m%02X\033[0m", (v)); \
 } while (0)
 
+/* ---------------- Μέτρηση πλάτους bit στο RX pin (RMT) ---------------- */
+
+#define BIT_NS        2000    /* 500 kbit/s */
+#define RMT_RES_HZ    40000000
+#define RMT_NS(t)     ((int32_t)(t) * 25)   /* 1 tick = 25 ns */
+
+typedef struct {
+    uint32_t n;
+    int64_t  sum;
+    int32_t  min, max;
+} pulse_stat_t;
+
+static pulse_stat_t s_ps[2];           /* [0] = low/dominant, [1] = high/recessive */
+static portMUX_TYPE s_ps_lock = portMUX_INITIALIZER_UNLOCKED;
+static QueueHandle_t s_rmt_q;
+static rmt_symbol_word_t s_rmt_buf[256];
+
+static bool rmt_done(rmt_channel_handle_t ch, const rmt_rx_done_event_data_t *e, void *ctx)
+{
+    BaseType_t woken = pdFALSE;
+    xQueueSendFromISR(s_rmt_q, e, &woken);
+    return woken == pdTRUE;
+}
+
+static void pulse_add(int level, uint32_t ticks)
+{
+    if (ticks == 0) return;
+    int32_t ns = RMT_NS(ticks);
+    int32_t bits = (ns + BIT_NS / 2) / BIT_NS;
+    if (bits < 1 || bits > 5) return;           /* έξω από frame ή idle */
+    int32_t err = ns - bits * BIT_NS;
+    pulse_stat_t *p = &s_ps[level ? 1 : 0];
+    portENTER_CRITICAL(&s_ps_lock);
+    if (p->n == 0 || err < p->min) p->min = err;
+    if (p->n == 0 || err > p->max) p->max = err;
+    p->n++;
+    p->sum += err;
+    portEXIT_CRITICAL(&s_ps_lock);
+}
+
+static void rmt_task(void *arg)
+{
+    rmt_channel_handle_t ch = arg;
+    rmt_receive_config_t rc = {
+        .signal_range_min_ns = 100,      /* φίλτρο για θόρυβο < 100 ns */
+        .signal_range_max_ns = 12000,    /* 6 recessive bits = τέλος frame */
+    };
+    rmt_rx_done_event_data_t ev;
+    for (;;) {
+        if (rmt_receive(ch, s_rmt_buf, sizeof(s_rmt_buf), &rc) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        if (xQueueReceive(s_rmt_q, &ev, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            continue;
+        }
+        for (size_t i = 0; i < ev.num_symbols; i++) {
+            pulse_add(ev.received_symbols[i].level0, ev.received_symbols[i].duration0);
+            pulse_add(ev.received_symbols[i].level1, ev.received_symbols[i].duration1);
+        }
+    }
+}
+
+static void pulse_start(void)
+{
+    s_rmt_q = xQueueCreate(4, sizeof(rmt_rx_done_event_data_t));
+    rmt_rx_channel_config_t cfg = {
+        .gpio_num = CAN_RX_GPIO,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = RMT_RES_HZ,
+        .mem_block_symbols = 96,
+    };
+    rmt_channel_handle_t ch = NULL;
+    if (rmt_new_rx_channel(&cfg, &ch) != ESP_OK) {
+        printf("RMT: init failed\n");
+        return;
+    }
+    rmt_rx_event_callbacks_t cbs = { .on_recv_done = rmt_done };
+    rmt_rx_register_event_callbacks(ch, &cbs, NULL);
+    rmt_enable(ch);
+    xTaskCreate(rmt_task, "rmt_rx", 4096, ch, 4, NULL);
+}
+
+/* Παίρνει και μηδενίζει τα στατιστικά του τελευταίου δευτερολέπτου. */
+static void pulse_take(pulse_stat_t out[2])
+{
+    portENTER_CRITICAL(&s_ps_lock);
+    out[0] = s_ps[0];
+    out[1] = s_ps[1];
+    memset(s_ps, 0, sizeof(s_ps));
+    portEXIT_CRITICAL(&s_ps_lock);
+}
+
 /* ---------------- Προστασία από πλημμύρα σφαλμάτων ---------------- */
 
 #define GUARD_MS        50
@@ -281,6 +380,7 @@ void app_main(void)
     can_open(best);
     reset_counters();
     xTaskCreate(guard_task, "can_guard", 3072, NULL, 10, NULL);
+    pulse_start();
 
     static slot_t snap[MAX_IDS];
     for (;;) {
@@ -332,6 +432,20 @@ void app_main(void)
             errs, e_stuff, e_form, e_bit, e_other);
         ADD(len, "total err %" PRIu32 "   state %s%s\n", rec.bus_err_num, state_name(st.state),
             full ? "   ID TABLE FULL" : "");
+
+        /* Πλάτος bit στο GPIO3 (ιδανικό: απόκλιση 0 ns) */
+        pulse_stat_t ps[2];
+        pulse_take(ps);
+        static const char *pname[2] = { "dominant (low) ", "recessive(high)" };
+        ADD(len, "RX pin bit width error (ideal 0 ns):\n");
+        for (int k = 0; k < 2; k++) {
+            if (ps[k].n) {
+                ADD(len, " %s avg %+5ld ns  min %+5ld  max %+5ld  (n %" PRIu32 ")\n", pname[k],
+                    (long)(ps[k].sum / (int64_t)ps[k].n), (long)ps[k].min, (long)ps[k].max, ps[k].n);
+            } else {
+                ADD(len, " %s no data\n", pname[k]);
+            }
+        }
         show();
 
         if (st.state == TWAI_ERROR_BUS_OFF) {
