@@ -1,6 +1,6 @@
 /*
  * leon-1p-can: ΜΟΝΟ CAN sniffer.
- * - Καμία οθόνη, κανένα LVGL.
+ * - Η οθόνη δείχνει ακριβώς το ίδιο κείμενο με το serial (μόνο κείμενο).
  * - CAN 500 kbit/s, μόνο ακρόαση (δεν στέλνει τίποτα στο αυτοκίνητο).
  * - Serial 115200 baud. Κάθε 1 δευτερόλεπτο τυπώνει έναν πίνακα:
  *   μία γραμμή για κάθε ID με πόσα μηνύματα ήρθαν και τα τελευταία δεδομένα,
@@ -15,6 +15,9 @@
 #include "freertos/task.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
+#include "bsp/esp-bsp.h"
+#include "bsp/display.h"
+#include "lvgl.h"
 
 #define CAN_TX_GPIO 2
 #define CAN_RX_GPIO 3
@@ -110,8 +113,43 @@ static int by_id(const void *a, const void *b)
     return (x->id > y->id) - (x->id < y->id);
 }
 
+static lv_obj_t *s_label;
+
+/* Οθόνη: μαύρο φόντο, ένα label με σταθερού πλάτους γράμματα, 2x μέγεθος. */
+static void screen_init(void)
+{
+    bsp_display_cfg_t cfg = {
+        .lv_adapter_cfg = ESP_LV_ADAPTER_DEFAULT_CONFIG(),
+        .rotation = ESP_LV_ADAPTER_ROTATE_0,
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL,
+    };
+    bsp_display_start_with_config(&cfg);
+
+    bsp_display_lock(-1);
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(s_label, &lv_font_unscii_16, 0);
+    lv_obj_set_style_text_color(s_label, lv_color_hex(0x00ff66), 0);
+    lv_obj_set_style_transform_scale(s_label, 512, 0);
+    lv_obj_set_style_transform_pivot_x(s_label, 0, 0);
+    lv_obj_set_style_transform_pivot_y(s_label, 0, 0);
+    lv_obj_set_pos(s_label, 8, 8);
+    lv_label_set_text(s_label, "leon-1p-can\nwaiting for CAN...");
+    bsp_display_unlock();
+
+    /* Backlight μία φορά, αφού έχει ζωγραφιστεί η πρώτη εικόνα. */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    bsp_display_backlight_on();
+}
+
 void app_main(void)
 {
+    screen_init();
+
     twai_onchip_node_config_t cfg = {
         .io_cfg = {
             .tx = CAN_TX_GPIO,
@@ -135,6 +173,7 @@ void app_main(void)
            CAN_TX_GPIO, CAN_RX_GPIO);
 
     static slot_t snap[MAX_IDS];
+    static char txt[4096];
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -152,26 +191,42 @@ void app_main(void)
 
         qsort(snap, n, sizeof(slot_t), by_id);
 
-        printf("\n   ID   /s  DLC  DATA\n");
-        for (int i = 0; i < n; i++) {
-            slot_t *s = &snap[i];
-            printf(s->ext ? "%08" PRIX32 : "     %03" PRIX32, s->id);
-            printf(" %4" PRIu32 "  [%u] ", s->count, s->len);
-            for (int b = 0; b < s->len; b++) {
-                printf(" %02X", s->data[b]);
-            }
-            printf("\n");
-        }
-
         twai_node_status_t st = {0};
         twai_node_record_t rec = {0};
         twai_node_get_info(node, &st, &rec);
         uint32_t errs = e_stuff + e_form + e_bit + e_other;
-        printf("--- %" PRIu32 " msg/s | IDs: %d | errors/s: %" PRIu32
-               " (stuff %" PRIu32 ", form %" PRIu32 ", bit %" PRIu32 ", other %" PRIu32 ")"
-               " | total errors: %" PRIu32 " | state: %s%s ---\n",
-               total, n, errs, e_stuff, e_form, e_bit, e_other,
-               rec.bus_err_num, state_name(st.state), full ? " | ID table full" : "");
+
+        /* Το ίδιο κείμενο πάει στο serial και στην οθόνη. */
+        int len = 0;
+#define ADD(...) do { if (len < (int)sizeof(txt)) len += snprintf(txt + len, sizeof(txt) - len, __VA_ARGS__); } while (0)
+        ADD("   ID   /s DLC DATA\n");
+        for (int i = 0; i < n; i++) {
+            slot_t *s = &snap[i];
+            if (s->ext) {
+                ADD("%08" PRIX32, s->id);
+            } else {
+                ADD("     %03" PRIX32, s->id);
+            }
+            ADD(" %4" PRIu32 " [%u]", s->count, s->len);
+            for (int b = 0; b < s->len; b++) {
+                ADD(" %02X", s->data[b]);
+            }
+            ADD("\n");
+        }
+        ADD("\nmsg/s %" PRIu32 "   IDs %d\n", total, n);
+        ADD("err/s %" PRIu32 " (stuff %" PRIu32 " form %" PRIu32 " bit %" PRIu32 " other %" PRIu32 ")\n",
+            errs, e_stuff, e_form, e_bit, e_other);
+        ADD("total err %" PRIu32 "   state %s%s\n", rec.bus_err_num, state_name(st.state),
+            full ? "   ID TABLE FULL" : "");
+#undef ADD
+
+        printf("\n%s", txt);
+
+        if (bsp_display_lock(100) == ESP_OK) {
+            lv_label_set_text(s_label, txt);
+            bsp_display_unlock();
+        }
+
         if (st.state == TWAI_ERROR_BUS_OFF) {
             twai_node_recover(node);
         }

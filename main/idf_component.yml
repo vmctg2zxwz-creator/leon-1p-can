@@ -1,0 +1,5 @@
+dependencies:
+  idf: ">=5.5"
+  waveshare/esp32_p4_platform: "2.0.1"
+  lvgl/lvgl:
+    version: ">=9.3,<9.6"
