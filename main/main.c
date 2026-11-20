@@ -2,6 +2,8 @@
  * leon-1p-can: ΜΟΝΟ CAN sniffer.
  * - Η οθόνη δείχνει ακριβώς το ίδιο κείμενο με το serial (μόνο κείμενο).
  * - CAN 500 kbit/s, μόνο ακρόαση (δεν στέλνει τίποτα στο αυτοκίνητο).
+ * - Στην εκκίνηση δοκιμάζει 9 χρονισμούς (SCAN_MS ο καθένας) και κρατάει
+ *   αυτόν με τα λιγότερα σφάλματα.
  * - Serial 115200 baud. Κάθε 1 δευτερόλεπτο τυπώνει έναν πίνακα:
  *   μία γραμμή για κάθε ID με πόσα μηνύματα ήρθαν και τα τελευταία δεδομένα,
  *   και στο τέλος μία γραμμή με στατιστικά (σφάλματα, κατάσταση).
@@ -95,17 +97,66 @@ static const char *state_name(twai_error_state_t s)
 }
 
 /*
- * Χρονισμός 500 kbit/s, βρέθηκε με scan στο αυτοκίνητο (20.11.2026):
- * 40 MHz / 4 = 10 MHz -> 20 quanta ανά bit = 1 + 13 + 6.
- * Sample point 70%, SJW 4 -> ~1260 msg/s, ~60 errors/s.
+ * Χρονισμοί για 500 kbit/s. Ρολόι CAN = 40 MHz (XTAL).
+ * bit = 1 + tseg1 + tseg2 quanta, quanta = brp / 40 MHz.
  */
-static const twai_timing_advanced_config_t s_timing = {
-    .brp = 4,
-    .prop_seg = 0,
-    .tseg_1 = 13,
-    .tseg_2 = 6,
-    .sjw = 4,
+typedef struct {
+    const char *name;
+    twai_timing_advanced_config_t t;
+} timing_t;
+
+static const timing_t s_timings[] = {
+    { "20tq SP65 SJW4", { .brp = 4, .tseg_1 = 12, .tseg_2 = 7, .sjw = 4 } },
+    { "20tq SP70 SJW4", { .brp = 4, .tseg_1 = 13, .tseg_2 = 6, .sjw = 4 } },
+    { "20tq SP75 SJW4", { .brp = 4, .tseg_1 = 14, .tseg_2 = 5, .sjw = 4 } },
+    { "20tq SP80 SJW4", { .brp = 4, .tseg_1 = 15, .tseg_2 = 4, .sjw = 4 } },
+    { "16tq SP69 SJW4", { .brp = 5, .tseg_1 = 10, .tseg_2 = 5, .sjw = 4 } },
+    { "16tq SP75 SJW4", { .brp = 5, .tseg_1 = 11, .tseg_2 = 4, .sjw = 4 } },
+    { "10tq SP60 SJW4", { .brp = 8, .tseg_1 = 5,  .tseg_2 = 4, .sjw = 4 } },
+    { "10tq SP70 SJW3", { .brp = 8, .tseg_1 = 6,  .tseg_2 = 3, .sjw = 3 } },
+    { "10tq SP80 SJW2", { .brp = 8, .tseg_1 = 7,  .tseg_2 = 2, .sjw = 2 } },
 };
+#define N_TIMINGS ((int)(sizeof(s_timings) / sizeof(s_timings[0])))
+#define SCAN_MS   5000
+
+static twai_node_handle_t s_node;
+
+/* Φτιάχνει από την αρχή τον CAN node με τον δοσμένο χρονισμό (μόνο ακρόαση). */
+static void can_open(const timing_t *t)
+{
+    if (s_node) {
+        twai_node_disable(s_node);
+        twai_node_delete(s_node);
+        s_node = NULL;
+    }
+    twai_onchip_node_config_t cfg = {
+        .io_cfg = {
+            .tx = CAN_TX_GPIO,
+            .rx = CAN_RX_GPIO,
+            .quanta_clk_out = -1,
+            .bus_off_indicator = -1,
+        },
+        .bit_timing = { .bitrate = CAN_BITRATE },
+        .tx_queue_depth = 1,
+        .flags = { .enable_listen_only = true },
+    };
+    ESP_ERROR_CHECK(twai_new_node_onchip(&cfg, &s_node));
+    ESP_ERROR_CHECK(twai_node_reconfig_timing(s_node, &t->t, NULL));
+    twai_event_callbacks_t cbs = { .on_rx_done = on_rx, .on_error = on_error };
+    ESP_ERROR_CHECK(twai_node_register_event_callbacks(s_node, &cbs, NULL));
+    ESP_ERROR_CHECK(twai_node_enable(s_node));
+}
+
+static void reset_counters(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_total = 0;
+    s_err_stuff = s_err_form = s_err_bit = s_err_other = 0;
+    for (int i = 0; i < s_used; i++) {
+        s_tab[i].count = 0;
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
 
 static int by_id(const void *a, const void *b)
 {
@@ -113,9 +164,15 @@ static int by_id(const void *a, const void *b)
     return (x->id > y->id) - (x->id < y->id);
 }
 
-static lv_obj_t *s_label;
+/* ---------------- Οθόνη: μόνο κείμενο ---------------- */
 
-/* Οθόνη: μαύρο φόντο, ένα label με σταθερού πλάτους γράμματα, 2x μέγεθος. */
+/* Η πλακέτα είναι τοποθετημένη οριζόντια: γυρνάμε το κείμενο 90°.
+ * Αν βγει ανάποδα, άλλαξε σε 2700. */
+#define TEXT_ROTATION 900
+
+static lv_obj_t *s_label;
+static char s_txt[4096];
+
 static void screen_init(void)
 {
     bsp_display_cfg_t cfg = {
@@ -134,46 +191,96 @@ static void screen_init(void)
     s_label = lv_label_create(scr);
     lv_obj_set_style_text_font(s_label, &lv_font_unscii_16, 0);
     lv_obj_set_style_text_color(s_label, lv_color_hex(0x00ff66), 0);
-    lv_obj_set_style_transform_scale(s_label, 512, 0);
+    lv_obj_set_style_transform_scale(s_label, 384, 0);       /* 1.5x */
+    lv_obj_set_style_transform_rotation(s_label, TEXT_ROTATION, 0);
     lv_obj_set_style_transform_pivot_x(s_label, 0, 0);
     lv_obj_set_style_transform_pivot_y(s_label, 0, 0);
-    lv_obj_set_pos(s_label, 8, 8);
-    lv_label_set_text(s_label, "leon-1p-can\nwaiting for CAN...");
+#if TEXT_ROTATION == 900
+    lv_obj_set_pos(s_label, 792, 8);          /* ξεκινά πάνω δεξιά */
+#else
+    lv_obj_set_pos(s_label, 8, 1272);         /* ξεκινά κάτω αριστερά */
+#endif
+    lv_label_set_text(s_label, "leon-1p-can");
     bsp_display_unlock();
 
-    /* Backlight μία φορά, αφού έχει ζωγραφιστεί η πρώτη εικόνα. */
     vTaskDelay(pdMS_TO_TICKS(100));
     bsp_display_backlight_on();
+}
+
+/* Στέλνει το s_txt στο serial και στην οθόνη. */
+static void show(void)
+{
+    printf("\n%s", s_txt);
+    if (bsp_display_lock(100) == ESP_OK) {
+        lv_label_set_text(s_label, s_txt);
+        bsp_display_unlock();
+    }
+}
+
+#define ADD(len, ...) do { if ((len) < (int)sizeof(s_txt)) (len) += snprintf(s_txt + (len), sizeof(s_txt) - (len), __VA_ARGS__); } while (0)
+
+/* ---------------- Scan χρονισμών ---------------- */
+
+static const timing_t *scan(void)
+{
+    static uint32_t msgs[N_TIMINGS], errs[N_TIMINGS], form[N_TIMINGS];
+    int len = 0;
+    s_txt[0] = 0;
+    ADD(len, "SYNC: %d timings x %d s, LISTEN-ONLY\n", N_TIMINGS, SCAN_MS / 1000);
+    show();
+
+    for (int i = 0; i < N_TIMINGS; i++) {
+        int mark = len;
+        ADD(len, "%d) %-15s testing...\n", i + 1, s_timings[i].name);
+        show();
+
+        can_open(&s_timings[i]);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        reset_counters();
+        vTaskDelay(pdMS_TO_TICKS(SCAN_MS));
+
+        portENTER_CRITICAL(&s_lock);
+        msgs[i] = s_total;
+        errs[i] = s_err_stuff + s_err_form + s_err_bit + s_err_other;
+        form[i] = s_err_form;
+        portEXIT_CRITICAL(&s_lock);
+
+        len = mark;
+        ADD(len, "%d) %-15s %5" PRIu32 " msg/s %5" PRIu32 " err/s\n", i + 1, s_timings[i].name,
+            msgs[i] * 1000 / SCAN_MS, errs[i] * 1000 / SCAN_MS);
+        show();
+    }
+
+    /* Καλύτερο: τα λιγότερα σφάλματα, ανάμεσα σε όσα πιάνουν >= 90% των μηνυμάτων. */
+    uint32_t max_msgs = 0;
+    for (int i = 0; i < N_TIMINGS; i++) {
+        if (msgs[i] > max_msgs) max_msgs = msgs[i];
+    }
+    int best = 1;   /* αν δεν έρθει τίποτα: SP70 */
+    if (max_msgs > 0) {
+        uint32_t best_errs = UINT32_MAX;
+        for (int i = 0; i < N_TIMINGS; i++) {
+            if (msgs[i] * 10 >= max_msgs * 9 && errs[i] < best_errs) {
+                best = i;
+                best_errs = errs[i];
+            }
+        }
+    }
+    ADD(len, "BEST: %d) %s\n", best + 1, s_timings[best].name);
+    show();
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    return &s_timings[best];
 }
 
 void app_main(void)
 {
     screen_init();
 
-    twai_onchip_node_config_t cfg = {
-        .io_cfg = {
-            .tx = CAN_TX_GPIO,
-            .rx = CAN_RX_GPIO,
-            .quanta_clk_out = -1,
-            .bus_off_indicator = -1,
-        },
-        .bit_timing = { .bitrate = CAN_BITRATE },
-        .tx_queue_depth = 1,
-        .flags = { .enable_listen_only = true },
-    };
-    twai_node_handle_t node;
-    ESP_ERROR_CHECK(twai_new_node_onchip(&cfg, &node));
-    twai_event_callbacks_t cbs = { .on_rx_done = on_rx, .on_error = on_error };
-    ESP_ERROR_CHECK(twai_node_register_event_callbacks(node, &cbs, NULL));
-
-    ESP_ERROR_CHECK(twai_node_reconfig_timing(node, &s_timing, NULL));
-    ESP_ERROR_CHECK(twai_node_enable(node));
-
-    printf("\n=== leon-1p-can sniffer: 500 kbit/s, SP70%% SJW4, LISTEN-ONLY, TX=GPIO%d RX=GPIO%d ===\n",
-           CAN_TX_GPIO, CAN_RX_GPIO);
+    const timing_t *best = scan();
+    can_open(best);
+    reset_counters();
 
     static slot_t snap[MAX_IDS];
-    static char txt[4096];
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
 
@@ -193,42 +300,34 @@ void app_main(void)
 
         twai_node_status_t st = {0};
         twai_node_record_t rec = {0};
-        twai_node_get_info(node, &st, &rec);
+        twai_node_get_info(s_node, &st, &rec);
         uint32_t errs = e_stuff + e_form + e_bit + e_other;
 
-        /* Το ίδιο κείμενο πάει στο serial και στην οθόνη. */
         int len = 0;
-#define ADD(...) do { if (len < (int)sizeof(txt)) len += snprintf(txt + len, sizeof(txt) - len, __VA_ARGS__); } while (0)
-        ADD("   ID   /s DLC DATA\n");
+        ADD(len, "timing: %s\n", best->name);
+        ADD(len, "   ID   /s DLC DATA\n");
         for (int i = 0; i < n; i++) {
             slot_t *s = &snap[i];
             if (s->ext) {
-                ADD("%08" PRIX32, s->id);
+                ADD(len, "%08" PRIX32, s->id);
             } else {
-                ADD("     %03" PRIX32, s->id);
+                ADD(len, "     %03" PRIX32, s->id);
             }
-            ADD(" %4" PRIu32 " [%u]", s->count, s->len);
+            ADD(len, " %4" PRIu32 " [%u]", s->count, s->len);
             for (int b = 0; b < s->len; b++) {
-                ADD(" %02X", s->data[b]);
+                ADD(len, " %02X", s->data[b]);
             }
-            ADD("\n");
+            ADD(len, "\n");
         }
-        ADD("\nmsg/s %" PRIu32 "   IDs %d\n", total, n);
-        ADD("err/s %" PRIu32 " (stuff %" PRIu32 " form %" PRIu32 " bit %" PRIu32 " other %" PRIu32 ")\n",
+        ADD(len, "msg/s %" PRIu32 "   IDs %d\n", total, n);
+        ADD(len, "err/s %" PRIu32 " (stuff %" PRIu32 " form %" PRIu32 " bit %" PRIu32 " other %" PRIu32 ")\n",
             errs, e_stuff, e_form, e_bit, e_other);
-        ADD("total err %" PRIu32 "   state %s%s\n", rec.bus_err_num, state_name(st.state),
+        ADD(len, "total err %" PRIu32 "   state %s%s\n", rec.bus_err_num, state_name(st.state),
             full ? "   ID TABLE FULL" : "");
-#undef ADD
-
-        printf("\n%s", txt);
-
-        if (bsp_display_lock(100) == ESP_OK) {
-            lv_label_set_text(s_label, txt);
-            bsp_display_unlock();
-        }
+        show();
 
         if (st.state == TWAI_ERROR_BUS_OFF) {
-            twai_node_recover(node);
+            twai_node_recover(s_node);
         }
     }
 }
