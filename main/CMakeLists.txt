@@ -1,5 +1,5 @@
 idf_component_register(
     SRCS "main.c"
     INCLUDE_DIRS "."
-    REQUIRES esp_driver_twai esp_timer
+    REQUIRES esp_driver_twai
 )

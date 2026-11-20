@@ -4,8 +4,8 @@ CAN sniffer για Seat Leon 1P σε Waveshare ESP32-P4 KIT-B. **Χωρίς οθ
 
 - CAN 500 kbit/s, **μόνο ακρόαση**: δεν στέλνει τίποτα στο αυτοκίνητο.
 - TX GPIO2 / RX GPIO3 (Adafruit CAN Pal, termination OFF).
-- Serial **921600 baud**. Κάθε γραμμή: `ID [DLC] data`.
-- Κάθε 1 s: `--- μηνύματα/s | bus errors | rx err count | state | dropped ---`
+- Serial **115200 baud**. Κάθε 1 s ένας πίνακας: μία γραμμή ανά ID με μηνύματα/s και τελευταία δεδομένα.
+- Στο τέλος: `--- μηνύματα/s | IDs | bus errors | rx err | state ---`
 
 ## Κατέβασμα .bin
 Tab **Actions** → τελευταίο run → **Artifacts** → `leon-1p-can-firmware`.
