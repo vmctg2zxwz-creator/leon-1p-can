@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_twai.h"
@@ -90,6 +91,76 @@ static const char *state_name(twai_error_state_t s)
     }
 }
 
+/*
+ * Αυτόματη αναζήτηση χρονισμού (sync).
+ * Ρολόι CAN = 40 MHz. Για 500 kbit/s: 40 MHz / brp = quanta, bit = 1 + tseg1 + tseg2.
+ * Δοκιμάζουμε κάθε ρύθμιση για SCAN_MS, μόνο ακρόαση, και κρατάμε την καλύτερη.
+ */
+#define SCAN_MS 3000
+
+typedef struct {
+    const char *name;
+    twai_timing_advanced_config_t t;
+} timing_t;
+
+static const timing_t s_timings[] = {
+    { "20tq SP70% SJW4",  { .brp = 4, .tseg_1 = 13, .tseg_2 = 6, .sjw = 4 } },
+    { "20tq SP75% SJW4",  { .brp = 4, .tseg_1 = 14, .tseg_2 = 5, .sjw = 4 } },
+    { "20tq SP80% SJW4",  { .brp = 4, .tseg_1 = 15, .tseg_2 = 4, .sjw = 4 } },
+    { "20tq SP85% SJW3",  { .brp = 4, .tseg_1 = 16, .tseg_2 = 3, .sjw = 3 } },
+    { "16tq SP75% SJW4",  { .brp = 5, .tseg_1 = 11, .tseg_2 = 4, .sjw = 4 } },
+    { "16tq SP81% SJW3",  { .brp = 5, .tseg_1 = 12, .tseg_2 = 3, .sjw = 3 } },
+    { "16tq SP87% SJW2",  { .brp = 5, .tseg_1 = 13, .tseg_2 = 2, .sjw = 2 } },
+    { "10tq SP70% SJW3",  { .brp = 8, .tseg_1 = 6,  .tseg_2 = 3, .sjw = 3 } },
+    { "10tq SP80% SJW2",  { .brp = 8, .tseg_1 = 7,  .tseg_2 = 2, .sjw = 2 } },
+};
+#define N_TIMINGS (sizeof(s_timings) / sizeof(s_timings[0]))
+
+static void apply_timing(twai_node_handle_t node, const timing_t *t)
+{
+    twai_node_disable(node);
+    ESP_ERROR_CHECK(twai_node_reconfig_timing(node, &t->t, NULL));
+    ESP_ERROR_CHECK(twai_node_enable(node));
+}
+
+static void reset_counters(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    s_total = 0;
+    s_err_stuff = s_err_form = s_err_bit = s_err_other = 0;
+    portEXIT_CRITICAL(&s_lock);
+}
+
+static const timing_t *scan_timings(twai_node_handle_t node)
+{
+    printf("\n=== SYNC: testing %d timings, %d s each ===\n", (int)N_TIMINGS, SCAN_MS / 1000);
+    int best = -1;
+    uint32_t best_msgs = 0, best_errs = UINT32_MAX;
+    for (int i = 0; i < (int)N_TIMINGS; i++) {
+        apply_timing(node, &s_timings[i]);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        reset_counters();
+        vTaskDelay(pdMS_TO_TICKS(SCAN_MS));
+        portENTER_CRITICAL(&s_lock);
+        uint32_t msgs = s_total;
+        uint32_t errs = s_err_stuff + s_err_form + s_err_bit + s_err_other;
+        portEXIT_CRITICAL(&s_lock);
+        uint32_t msgs_s = msgs * 1000 / SCAN_MS, errs_s = errs * 1000 / SCAN_MS;
+        printf("  %d) %-18s -> %5" PRIu32 " msg/s, %6" PRIu32 " errors/s\n", i + 1, s_timings[i].name, msgs_s, errs_s);
+        if (msgs > best_msgs || (msgs == best_msgs && errs < best_errs)) {
+            best = i;
+            best_msgs = msgs;
+            best_errs = errs;
+        }
+    }
+    if (best < 0) {
+        best = 2;   /* τίποτα δεν ήρθε: μένουμε στο 80% */
+    }
+    printf("=== BEST: %d) %s ===\n", best + 1, s_timings[best].name);
+    reset_counters();
+    return &s_timings[best];
+}
+
 static int by_id(const void *a, const void *b)
 {
     const slot_t *x = a, *y = b;
@@ -111,27 +182,14 @@ void app_main(void)
     };
     twai_node_handle_t node;
     ESP_ERROR_CHECK(twai_new_node_onchip(&cfg, &node));
-    /*
-     * Χρονισμός 500 kbit/s με ρολόι 40 MHz (XTAL):
-     * 40 MHz / 4 = 10 MHz -> 20 quanta ανά bit = 1 + 15 + 4.
-     * Sample point 80% (όπως το προηγούμενο build που δούλευε καλύτερα),
-     * αλλά με μέγιστο SJW = 4 ώστε να ανέχεται περισσότερο θόρυβο/απόκλιση.
-     */
-    twai_timing_advanced_config_t timing = {
-        .brp = 4,
-        .prop_seg = 0,
-        .tseg_1 = 15,
-        .tseg_2 = 4,
-        .sjw = 4,
-    };
-    ESP_ERROR_CHECK(twai_node_reconfig_timing(node, &timing, NULL));
-
     twai_event_callbacks_t cbs = { .on_rx_done = on_rx, .on_error = on_error };
     ESP_ERROR_CHECK(twai_node_register_event_callbacks(node, &cbs, NULL));
-    ESP_ERROR_CHECK(twai_node_enable(node));
 
-    printf("\n=== leon-1p-can sniffer: %d kbit/s (SP 80%%, SJW 4), LISTEN-ONLY, TX=GPIO%d RX=GPIO%d ===\n",
-           CAN_BITRATE / 1000, CAN_TX_GPIO, CAN_RX_GPIO);
+    const timing_t *best = scan_timings(node);
+    apply_timing(node, best);
+
+    printf("\n=== leon-1p-can sniffer: 500 kbit/s, %s, LISTEN-ONLY, TX=GPIO%d RX=GPIO%d ===\n",
+           best->name, CAN_TX_GPIO, CAN_RX_GPIO);
 
     static slot_t snap[MAX_IDS];
     for (;;) {
