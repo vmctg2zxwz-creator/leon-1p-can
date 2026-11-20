@@ -2,8 +2,8 @@
  * leon-1p-can: ΜΟΝΟ CAN sniffer.
  * - Η οθόνη δείχνει ακριβώς το ίδιο κείμενο με το serial (μόνο κείμενο).
  * - CAN 500 kbit/s, μόνο ακρόαση (δεν στέλνει τίποτα στο αυτοκίνητο).
- * - Στην εκκίνηση δοκιμάζει 9 χρονισμούς (SCAN_MS ο καθένας) και κρατάει
- *   αυτόν με τα λιγότερα σφάλματα.
+ * - Χρονισμός σταθερός: SP65 (βρέθηκε με scan στο αυτοκίνητο, 0 err/s).
+ * - Προστασία: αν έρθουν πάρα πολλά σφάλματα, το CAN σταματά για 2 s.
  * - Serial 115200 baud. Κάθε 1 δευτερόλεπτο τυπώνει έναν πίνακα:
  *   μία γραμμή για κάθε ID με πόσα μηνύματα ήρθαν και τα τελευταία δεδομένα,
  *   και στο τέλος μία γραμμή με στατιστικά (σφάλματα, κατάσταση).
@@ -20,6 +20,7 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 #include "lvgl.h"
+#include "esp_system.h"
 
 #define CAN_TX_GPIO 2
 #define CAN_RX_GPIO 3
@@ -38,6 +39,8 @@ static slot_t s_tab[MAX_IDS];
 static int s_used;
 static uint32_t s_total, s_full;
 static uint32_t s_err_stuff, s_err_form, s_err_bit, s_err_other;
+static volatile uint32_t s_err_all;   /* σύνολο, για την προστασία */
+static volatile uint32_t s_pauses;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static bool on_rx(twai_node_handle_t node, const twai_rx_done_event_data_t *e, void *ctx)
@@ -81,6 +84,7 @@ static bool on_error(twai_node_handle_t node, const twai_error_event_data_t *e, 
     else if (e->err_flags.form_err) s_err_form++;
     else if (e->err_flags.bit_err) s_err_bit++;
     else s_err_other++;
+    s_err_all++;
     portEXIT_CRITICAL_ISR(&s_lock);
     return false;
 }
@@ -97,27 +101,16 @@ static const char *state_name(twai_error_state_t s)
 }
 
 /*
- * Χρονισμοί για 500 kbit/s. Ρολόι CAN = 40 MHz (XTAL).
- * bit = 1 + tseg1 + tseg2 quanta, quanta = brp / 40 MHz.
+ * Χρονισμός 500 kbit/s, ρολόι CAN 40 MHz (XTAL): 40 MHz / 4 -> 20 quanta ανά bit = 1 + 12 + 7.
+ * Sample point 65%, SJW 4. Scan στο αυτοκίνητο (20.11.2026):
+ *   SP65 1270 msg/s 0 err/s | SP70 1266/20 | SP75 1189/385 | SP80 -> error flood
  */
 typedef struct {
     const char *name;
     twai_timing_advanced_config_t t;
 } timing_t;
 
-static const timing_t s_timings[] = {
-    { "20tq SP65 SJW4", { .brp = 4, .tseg_1 = 12, .tseg_2 = 7, .sjw = 4 } },
-    { "20tq SP70 SJW4", { .brp = 4, .tseg_1 = 13, .tseg_2 = 6, .sjw = 4 } },
-    { "20tq SP75 SJW4", { .brp = 4, .tseg_1 = 14, .tseg_2 = 5, .sjw = 4 } },
-    { "20tq SP80 SJW4", { .brp = 4, .tseg_1 = 15, .tseg_2 = 4, .sjw = 4 } },
-    { "16tq SP69 SJW4", { .brp = 5, .tseg_1 = 10, .tseg_2 = 5, .sjw = 4 } },
-    { "16tq SP75 SJW4", { .brp = 5, .tseg_1 = 11, .tseg_2 = 4, .sjw = 4 } },
-    { "10tq SP60 SJW4", { .brp = 8, .tseg_1 = 5,  .tseg_2 = 4, .sjw = 4 } },
-    { "10tq SP70 SJW3", { .brp = 8, .tseg_1 = 6,  .tseg_2 = 3, .sjw = 3 } },
-    { "10tq SP80 SJW2", { .brp = 8, .tseg_1 = 7,  .tseg_2 = 2, .sjw = 2 } },
-};
-#define N_TIMINGS ((int)(sizeof(s_timings) / sizeof(s_timings[0])))
-#define SCAN_MS   5000
+static const timing_t s_timing = { "20tq SP65 SJW4", { .brp = 4, .tseg_1 = 12, .tseg_2 = 7, .sjw = 4 } };
 
 static twai_node_handle_t s_node;
 
@@ -219,66 +212,55 @@ static void show(void)
 
 #define ADD(len, ...) do { if ((len) < (int)sizeof(s_txt)) (len) += snprintf(s_txt + (len), sizeof(s_txt) - (len), __VA_ARGS__); } while (0)
 
-/* ---------------- Scan χρονισμών ---------------- */
+/* ---------------- Προστασία από πλημμύρα σφαλμάτων ---------------- */
 
-static const timing_t *scan(void)
+#define GUARD_MS        50
+#define GUARD_MAX_ERRS  200     /* > 200 σφάλματα σε 50 ms (= 4000/s) -> παύση */
+#define GUARD_PAUSE_MS  2000
+
+static void guard_task(void *arg)
 {
-    static uint32_t msgs[N_TIMINGS], errs[N_TIMINGS], form[N_TIMINGS];
-    int len = 0;
-    s_txt[0] = 0;
-    ADD(len, "SYNC: %d timings x %d s, LISTEN-ONLY\n", N_TIMINGS, SCAN_MS / 1000);
-    show();
-
-    for (int i = 0; i < N_TIMINGS; i++) {
-        int mark = len;
-        ADD(len, "%d) %-15s testing...\n", i + 1, s_timings[i].name);
-        show();
-
-        can_open(&s_timings[i]);
-        vTaskDelay(pdMS_TO_TICKS(300));
-        reset_counters();
-        vTaskDelay(pdMS_TO_TICKS(SCAN_MS));
-
-        portENTER_CRITICAL(&s_lock);
-        msgs[i] = s_total;
-        errs[i] = s_err_stuff + s_err_form + s_err_bit + s_err_other;
-        form[i] = s_err_form;
-        portEXIT_CRITICAL(&s_lock);
-
-        len = mark;
-        ADD(len, "%d) %-15s %5" PRIu32 " msg/s %5" PRIu32 " err/s\n", i + 1, s_timings[i].name,
-            msgs[i] * 1000 / SCAN_MS, errs[i] * 1000 / SCAN_MS);
-        show();
-    }
-
-    /* Καλύτερο: τα λιγότερα σφάλματα, ανάμεσα σε όσα πιάνουν >= 90% των μηνυμάτων. */
-    uint32_t max_msgs = 0;
-    for (int i = 0; i < N_TIMINGS; i++) {
-        if (msgs[i] > max_msgs) max_msgs = msgs[i];
-    }
-    int best = 1;   /* αν δεν έρθει τίποτα: SP70 */
-    if (max_msgs > 0) {
-        uint32_t best_errs = UINT32_MAX;
-        for (int i = 0; i < N_TIMINGS; i++) {
-            if (msgs[i] * 10 >= max_msgs * 9 && errs[i] < best_errs) {
-                best = i;
-                best_errs = errs[i];
-            }
+    uint32_t last = s_err_all;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(GUARD_MS));
+        uint32_t now = s_err_all;
+        if (now - last > GUARD_MAX_ERRS) {
+            twai_node_disable(s_node);
+            s_pauses++;
+            printf("!!! CAN error flood (%" PRIu32 " in %d ms): paused %d ms\n",
+                   now - last, GUARD_MS, GUARD_PAUSE_MS);
+            vTaskDelay(pdMS_TO_TICKS(GUARD_PAUSE_MS));
+            twai_node_enable(s_node);
+            now = s_err_all;
         }
+        last = now;
     }
-    ADD(len, "BEST: %d) %s\n", best + 1, s_timings[best].name);
-    show();
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    return &s_timings[best];
+}
+
+static const char *reset_name(esp_reset_reason_t r)
+{
+    switch (r) {
+    case ESP_RST_POWERON:  return "power on";
+    case ESP_RST_SW:       return "software";
+    case ESP_RST_PANIC:    return "PANIC (crash)";
+    case ESP_RST_INT_WDT:  return "INTERRUPT WATCHDOG";
+    case ESP_RST_TASK_WDT: return "TASK WATCHDOG";
+    case ESP_RST_WDT:      return "WATCHDOG";
+    case ESP_RST_BROWNOUT: return "BROWNOUT (low voltage)";
+    case ESP_RST_EXT:      return "reset button";
+    default:               return "other";
+    }
 }
 
 void app_main(void)
 {
+    const char *boot = reset_name(esp_reset_reason());
     screen_init();
 
-    const timing_t *best = scan();
+    const timing_t *best = &s_timing;
     can_open(best);
     reset_counters();
+    xTaskCreate(guard_task, "can_guard", 3072, NULL, 10, NULL);
 
     static slot_t snap[MAX_IDS];
     for (;;) {
@@ -304,7 +286,7 @@ void app_main(void)
         uint32_t errs = e_stuff + e_form + e_bit + e_other;
 
         int len = 0;
-        ADD(len, "timing: %s\n", best->name);
+        ADD(len, "timing: %s   last reset: %s   pauses: %" PRIu32 "\n", best->name, boot, s_pauses);
         ADD(len, "   ID   /s DLC DATA\n");
         for (int i = 0; i < n; i++) {
             slot_t *s = &snap[i];
