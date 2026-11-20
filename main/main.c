@@ -105,18 +105,32 @@ void app_main(void)
             .quanta_clk_out = -1,
             .bus_off_indicator = -1,
         },
-        /* Sample point 87.5%, όπως συνήθως στο CAN της VW. */
-        .bit_timing = { .bitrate = CAN_BITRATE, .sp_permill = 875 },
+        .bit_timing = { .bitrate = CAN_BITRATE },
         .tx_queue_depth = 1,
         .flags = { .enable_listen_only = true },
     };
     twai_node_handle_t node;
     ESP_ERROR_CHECK(twai_new_node_onchip(&cfg, &node));
+    /*
+     * Χρονισμός 500 kbit/s με ρολόι 40 MHz (XTAL):
+     * 40 MHz / 4 = 10 MHz -> 20 quanta ανά bit = 1 + 15 + 4.
+     * Sample point 80% (όπως το προηγούμενο build που δούλευε καλύτερα),
+     * αλλά με μέγιστο SJW = 4 ώστε να ανέχεται περισσότερο θόρυβο/απόκλιση.
+     */
+    twai_timing_advanced_config_t timing = {
+        .brp = 4,
+        .prop_seg = 0,
+        .tseg_1 = 15,
+        .tseg_2 = 4,
+        .sjw = 4,
+    };
+    ESP_ERROR_CHECK(twai_node_reconfig_timing(node, &timing, NULL));
+
     twai_event_callbacks_t cbs = { .on_rx_done = on_rx, .on_error = on_error };
     ESP_ERROR_CHECK(twai_node_register_event_callbacks(node, &cbs, NULL));
     ESP_ERROR_CHECK(twai_node_enable(node));
 
-    printf("\n=== leon-1p-can sniffer: %d kbit/s, LISTEN-ONLY, TX=GPIO%d RX=GPIO%d ===\n",
+    printf("\n=== leon-1p-can sniffer: %d kbit/s (SP 80%%, SJW 4), LISTEN-ONLY, TX=GPIO%d RX=GPIO%d ===\n",
            CAN_BITRATE / 1000, CAN_TX_GPIO, CAN_RX_GPIO);
 
     static slot_t snap[MAX_IDS];
