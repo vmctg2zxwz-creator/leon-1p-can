@@ -2,7 +2,8 @@
  * leon-1p-can: ΜΟΝΟ CAN sniffer.
  * - Η οθόνη δείχνει ακριβώς το ίδιο κείμενο με το serial (μόνο κείμενο).
  * - CAN 500 kbit/s, μόνο ακρόαση (δεν στέλνει τίποτα στο αυτοκίνητο).
- * - Χρονισμός σταθερός: SP65 (βρέθηκε με scan στο αυτοκίνητο, 0 err/s).
+ * - Στην εκκίνηση: τεστ όλων των SP% (60-85) x SJW (1-4), 3 s το καθένα,
+ *   μόνο ακρόαση. Κρατάει τον καλύτερο συνδυασμό.
  * - Bytes που άλλαξαν μέσα στο τελευταίο δευτερόλεπτο βγαίνουν ΚΟΚΚΙΝΑ
  *   (για να βρίσκουμε ποιο byte είναι γκάζι, φρένο, τιμόνι κ.λπ.).
  * - Μέτρηση σήματος: το RMT διαβάζει το ίδιο pin RX (GPIO3) και μετράει πόσο
@@ -124,7 +125,7 @@ typedef struct {
     twai_timing_advanced_config_t t;
 } timing_t;
 
-static const timing_t s_timing = { "20tq SP65 SJW4", { .brp = 4, .tseg_1 = 12, .tseg_2 = 7, .sjw = 4 } };
+static const timing_t s_timing_unused __attribute__((unused)) = { "20tq SP65 SJW4", { .brp = 4, .tseg_1 = 12, .tseg_2 = 7, .sjw = 4 } };
 
 static twai_node_handle_t s_node;
 
@@ -237,6 +238,115 @@ static int s_len_ser;
     if ((len) < (int)sizeof(s_txt)) (len) += snprintf(s_txt + (len), sizeof(s_txt) - (len), " #ff3030 %02X#", (v)); \
     if (s_len_ser < (int)sizeof(s_ser)) s_len_ser += snprintf(s_ser + s_len_ser, sizeof(s_ser) - s_len_ser, " \033[1;31m%02X\033[0m", (v)); \
 } while (0)
+
+
+/* ---------------- Τεστ SJW x sample point (μόνο ακρόαση) ---------------- */
+
+/* 20 quanta ανά bit (40 MHz / 4 = 10 MHz). SP = (1 + tseg1) / 20. */
+static const struct { int sp, t1, t2; } s_sp[] = {
+    { 60, 11, 8 }, { 65, 12, 7 }, { 70, 13, 6 }, { 75, 14, 5 }, { 80, 15, 4 }, { 85, 16, 3 },
+};
+#define N_SP      ((int)(sizeof(s_sp) / sizeof(s_sp[0])))
+#define N_SJW     4
+#define TEST_MS   3000
+#define FLOOD_ERR 200        /* > 200 σφάλματα σε 50 ms -> σταματάμε αυτό το τεστ */
+
+static int32_t s_res_msgs[N_SP][N_SJW];   /* -1 = δεν γίνεται, -2 = flood */
+static int32_t s_res_errs[N_SP][N_SJW];
+static timing_t s_best;
+static char s_best_name[32];
+
+static void scan_table(int cur_sp, int cur_sjw)
+{
+    int len = 0;
+    s_len_ser = 0;
+    ADD(len, "SJW x SP%% TEST, LISTEN-ONLY, %d s each\n", TEST_MS / 1000);
+    ADD(len, "cell = msg/s / err/s\n\n");
+    ADD(len, " SP%%      SJW1         SJW2         SJW3         SJW4\n");
+    for (int i = 0; i < N_SP; i++) {
+        ADD(len, " %2d ", s_sp[i].sp);
+        for (int j = 0; j < N_SJW; j++) {
+            int32_t m = s_res_msgs[i][j], e = s_res_errs[i][j];
+            if (i == cur_sp && j == cur_sjw)      ADD(len, "  %-11s", "testing..");
+            else if (m == -1)                      ADD(len, "  %-11s", "-");
+            else if (m == -2)                      ADD(len, "  %-11s", "FLOOD");
+            else if (m == -3)                      ADD(len, "  %-11s", "");
+            else                                   ADD(len, "  %4ld/%-6ld", (long)m, (long)e);
+        }
+        ADD(len, "\n");
+    }
+    show();
+}
+
+static const timing_t *sjw_scan(void)
+{
+    for (int i = 0; i < N_SP; i++) {
+        for (int j = 0; j < N_SJW; j++) {
+            s_res_msgs[i][j] = (j + 1 > s_sp[i].t2) ? -1 : -3;
+            s_res_errs[i][j] = 0;
+        }
+    }
+    for (int i = 0; i < N_SP; i++) {
+        for (int j = 0; j < N_SJW; j++) {
+            if (s_res_msgs[i][j] == -1) continue;
+            scan_table(i, j);
+            timing_t t = { "", { .brp = 4, .tseg_1 = s_sp[i].t1, .tseg_2 = s_sp[i].t2, .sjw = j + 1 } };
+            can_open(&t);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            reset_counters();
+            bool flood = false;
+            uint32_t last = s_err_all;
+            for (int k = 0; k < TEST_MS / 50; k++) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                uint32_t now = s_err_all;
+                if (now - last > FLOOD_ERR) { flood = true; break; }
+                last = now;
+            }
+            twai_node_disable(s_node);
+            portENTER_CRITICAL(&s_lock);
+            uint32_t msgs = s_total;
+            uint32_t errs = s_err_stuff + s_err_form + s_err_bit + s_err_other;
+            portEXIT_CRITICAL(&s_lock);
+            if (flood) {
+                s_res_msgs[i][j] = -2;
+            } else {
+                s_res_msgs[i][j] = msgs * 1000 / TEST_MS;
+                s_res_errs[i][j] = errs * 1000 / TEST_MS;
+            }
+        }
+    }
+    scan_table(-1, -1);
+
+    /* Καλύτερο: λιγότερα σφάλματα ανάμεσα σε όσα πιάνουν >= 95% των μηνυμάτων.
+     * Σε ισοπαλία: το πιο κοντά στο SP75 και με μεγαλύτερο SJW. */
+    int32_t max_m = 0;
+    for (int i = 0; i < N_SP; i++)
+        for (int j = 0; j < N_SJW; j++)
+            if (s_res_msgs[i][j] > max_m) max_m = s_res_msgs[i][j];
+    int bi = 1, bj = 3;   /* αν δεν έρθει τίποτα: SP65 SJW4 */
+    if (max_m > 0) {
+        int32_t best_e = INT32_MAX, best_d = INT32_MAX;
+        for (int i = 0; i < N_SP; i++) {
+            for (int j = 0; j < N_SJW; j++) {
+                int32_t m = s_res_msgs[i][j], e = s_res_errs[i][j];
+                if (m < 0 || m * 100 < max_m * 95) continue;
+                int32_t d = abs(s_sp[i].sp - 75) * 10 + (N_SJW - 1 - j);
+                if (e < best_e || (e == best_e && d < best_d)) {
+                    best_e = e; best_d = d; bi = i; bj = j;
+                }
+            }
+        }
+    }
+    snprintf(s_best_name, sizeof(s_best_name), "20tq SP%d SJW%d", s_sp[bi].sp, bj + 1);
+    s_best.name = s_best_name;
+    s_best.t = (twai_timing_advanced_config_t){ .brp = 4, .tseg_1 = s_sp[bi].t1, .tseg_2 = s_sp[bi].t2, .sjw = bj + 1 };
+
+    int len = (int)strlen(s_txt);
+    ADD(len, "\nBEST: %s  (keeping it, table stays 10 s)\n", s_best_name);
+    show();
+    vTaskDelay(pdMS_TO_TICKS(10000));
+    return &s_best;
+}
 
 /* ---------------- Μέτρηση πλάτους bit στο RX pin (RMT) ---------------- */
 
@@ -376,7 +486,7 @@ void app_main(void)
     const char *boot = reset_name(esp_reset_reason());
     screen_init();
 
-    const timing_t *best = &s_timing;
+    const timing_t *best = sjw_scan();
     can_open(best);
     reset_counters();
     xTaskCreate(guard_task, "can_guard", 3072, NULL, 10, NULL);
