@@ -2,8 +2,8 @@
  * leon-1p-can: ΜΟΝΟ CAN sniffer.
  * - Η οθόνη δείχνει ακριβώς το ίδιο κείμενο με το serial (μόνο κείμενο).
  * - CAN 500 kbit/s, μόνο ακρόαση (δεν στέλνει τίποτα στο αυτοκίνητο).
- * - Στην εκκίνηση: τεστ όλων των SP% (60-85) x SJW (1-4), 3 s το καθένα,
- *   μόνο ακρόαση. Κρατάει τον καλύτερο συνδυασμό.
+ * - Χρονισμός σταθερός SP75 SJW4 (βρέθηκε με τεστ, 0 err/s με SN65HVD230).
+ *   Το τεστ SP% x SJW ξαναμπαίνει με RUN_SJW_TEST 1.
  * - Bytes που άλλαξαν μέσα στο τελευταίο δευτερόλεπτο βγαίνουν ΚΟΚΚΙΝΑ
  *   (για να βρίσκουμε ποιο byte είναι γκάζι, φρένο, τιμόνι κ.λπ.).
  * - Μέτρηση σήματος: το RMT διαβάζει το ίδιο pin RX (GPIO3) και μετράει πόσο
@@ -125,7 +125,12 @@ typedef struct {
     twai_timing_advanced_config_t t;
 } timing_t;
 
-static const timing_t s_timing_unused __attribute__((unused)) = { "20tq SP65 SJW4", { .brp = 4, .tseg_1 = 12, .tseg_2 = 7, .sjw = 4 } };
+/* SN65HVD230, τεστ στο αυτοκίνητο 22.11.2026: SP75 SJW4 -> 1351 msg/s, 0 err/s,
+ * πλάτος bit στο pin: dominant -28 ns, recessive +35 ns (καθαρό σήμα). */
+static const timing_t s_timing = { "20tq SP75 SJW4", { .brp = 4, .tseg_1 = 14, .tseg_2 = 5, .sjw = 4 } };
+
+/* 1 = κάνε ξανά το τεστ SP% x SJW στην εκκίνηση (~1.5 λεπτό). */
+#define RUN_SJW_TEST 0
 
 static twai_node_handle_t s_node;
 
@@ -278,7 +283,7 @@ static void scan_table(int cur_sp, int cur_sjw)
     show();
 }
 
-static const timing_t *sjw_scan(void)
+static __attribute__((unused)) const timing_t *sjw_scan(void)
 {
     for (int i = 0; i < N_SP; i++) {
         for (int j = 0; j < N_SJW; j++) {
@@ -486,7 +491,11 @@ void app_main(void)
     const char *boot = reset_name(esp_reset_reason());
     screen_init();
 
+#if RUN_SJW_TEST
     const timing_t *best = sjw_scan();
+#else
+    const timing_t *best = &s_timing;
+#endif
     can_open(best);
     reset_counters();
     xTaskCreate(guard_task, "can_guard", 3072, NULL, 10, NULL);
